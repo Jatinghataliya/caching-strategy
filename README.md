@@ -215,14 +215,14 @@ sequenceDiagram
     participant Cache as Cache (Redis)
     participant DB as Database
 
-    T1->>Cache: Get(key) — MISS
-    T2->>Cache: Get(key) — MISS (simultaneous)
+    T1->>Cache: Get(key) - MISS
+    T2->>Cache: Get(key) - MISS (simultaneous)
     Note over T1,T2: Without mitigation: ALL threads hit DB
-    T1->>DB: [Mutex] Acquires lock — fetches record
+    T1->>DB: [Mutex] Acquires lock - fetches record
     T2-->>T2: [Mutex] Waits for lock
     DB-->>T1: Return record
     T1->>Cache: Re-populate key with TTL
-    T2->>Cache: Double-check hit — reuses result
+    T2->>Cache: Double-check hit - reuses result
 ```
 - **Mutex / Singleflight** — [`CacheStampedeMitigation.getUserWithMutex()`](src/main/java/com/example/caching/failures/CacheStampedeMitigation.java)
 - **XFetch Probabilistic Early Expiration** — [`CacheStampedeMitigation.getUserWithXFetch()`](src/main/java/com/example/caching/failures/CacheStampedeMitigation.java)
@@ -235,11 +235,11 @@ sequenceDiagram
     participant Cache as Cache (Redis)
     participant DB as Database
 
-    Note over Keys,Cache: Without mitigation: all keys share same TTL → all expire at once
-    Keys->>Cache: [Jitter] Set key-A TTL = 300 + random(-30..+30)
-    Keys->>Cache: [Jitter] Set key-B TTL = 300 + random(-30..+30)
-    Keys->>Cache: [Jitter] Set key-C TTL = 300 + random(-30..+30)
-    Note over Keys,Cache: Expiries spread over 60s window — DB load stays flat
+    Note over Keys,Cache: Without mitigation: all keys share same TTL, all expire at once
+    Keys->>Cache: [Jitter] Set key-A TTL = 300 + rand jitter
+    Keys->>Cache: [Jitter] Set key-B TTL = 300 + rand jitter
+    Keys->>Cache: [Jitter] Set key-C TTL = 300 + rand jitter
+    Note over Keys,Cache: Expiries spread over 60s window - DB load stays flat
 ```
 - **TTL Jitter** — [`CacheAvalancheMitigation.getUser()`](src/main/java/com/example/caching/failures/CacheAvalancheMitigation.java)
 - **Staggered Warm-Up** — [`CacheAvalancheMitigation.staggeredWarmUp()`](src/main/java/com/example/caching/failures/CacheAvalancheMitigation.java)
@@ -254,12 +254,12 @@ sequenceDiagram
     participant DB as Database
 
     Attacker->>Filter: Get(ghost-key-999)
-    Filter-->>Attacker: DEFINITELY NOT EXISTS — request blocked
+    Filter-->>Attacker: DEFINITELY NOT EXISTS - request blocked
     Note over Filter,DB: DB never touched
 
-    Attacker->>Cache: Get(ghost-key-999) [without Bloom Filter]
-    Cache-->>Attacker: MISS — null sentinel found (2nd+ requests)
-    Note over Cache,DB: DB only hit once; all subsequent hits serve sentinel from cache
+    Attacker->>Cache: Get(ghost-key-999) without Bloom Filter
+    Cache-->>Attacker: MISS - null sentinel found on 2nd+ requests
+    Note over Cache,DB: DB only hit once, subsequent hits serve sentinel from cache
 ```
 - **Null Sentinel Caching** — [`CachePenetrationMitigation.getUserWithNullCache()`](src/main/java/com/example/caching/failures/CachePenetrationMitigation.java)
 - **Bloom Filter Guard** — [`CachePenetrationMitigation.getUserWithBloomFilter()`](src/main/java/com/example/caching/failures/CachePenetrationMitigation.java)
