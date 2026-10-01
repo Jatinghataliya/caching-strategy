@@ -211,7 +211,7 @@ sequenceDiagram
 sequenceDiagram
     autonumber
     actor T1 as Thread-1
-    actor T2 as Thread-2 … N
+    actor T2 as Thread-2 to N
     participant Cache as Cache (Redis)
     participant DB as Database
 
@@ -275,7 +275,7 @@ sequenceDiagram
 
     App->>DB: 1. Write updated record
     DB-->>App: 2. Acknowledge
-    DB-)CDC: 3. Emit change event (WAL / Outbox)
+    DB-->>CDC: 3. Emit change event (WAL / Outbox)
     CDC->>Cache: 4. Evict stale key
     Note over Cache: Next read fetches fresh record from DB
 ```
