@@ -171,7 +171,7 @@ sequenceDiagram
     App->>Cache: 1. Get(key)
     Cache-->>App: 2. Return cached value (Hit)
     Note over App,BgTask: Remaining TTL < 20% (Threshold Passed)
-    App->)BgTask: 3. Trigger proactive refresh
+    App->>BgTask: 3. Trigger proactive refresh (async)
     BgTask->>DB: 4. Fetch fresh record from DB
     DB-->>BgTask: 5. Return updated record
     BgTask->>Cache: 6. Re-populate Redis with new TTL
