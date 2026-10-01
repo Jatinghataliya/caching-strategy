@@ -1,11 +1,16 @@
 package com.example.caching;
 
+import com.example.caching.cache.DistributedLockClient;
+import com.example.caching.cache.RateLimiterClient;
 import com.example.caching.cache.RedisClient;
 import com.example.caching.failures.CacheAvalancheMitigation;
 import com.example.caching.failures.CachePenetrationMitigation;
 import com.example.caching.failures.CacheStampedeMitigation;
 import com.example.caching.failures.StaleDataMitigation;
 import com.example.caching.model.User;
+import com.example.caching.patterns.CacheWarmer;
+import com.example.caching.patterns.MultiLevelCache;
+import com.example.caching.patterns.SegmentedCache;
 import com.example.caching.repository.UserRepository;
 import com.example.caching.strategies.CacheAsideUserService;
 import com.example.caching.strategies.ReadAndWriteThroughCache;
@@ -14,6 +19,8 @@ import com.example.caching.strategies.WriteAroundUserService;
 import com.example.caching.strategies.WriteBehindCache;
 import redis.clients.jedis.JedisPool;
 import redis.clients.jedis.JedisPoolConfig;
+
+import java.util.List;
 
 public class Main {
     public static void main(String[] args) throws InterruptedException {
@@ -196,7 +203,119 @@ public class Main {
                 staleService.getUser("u-102").ifPresent(u -> System.out.println("After Outbox eviction: " + u));
             }
 
-            System.out.println("\nAll strategy and failure-mode demos completed successfully.");
+            // ================================================================
+            // SECTION 3: ADVANCED CACHING PATTERNS
+            // ================================================================
+
+            // 10. MULTI-LEVEL CACHE (L1 + L2)
+            System.out.println("\n==================================================");
+            System.out.println("  10. MULTI-LEVEL CACHE (L1 local + L2 Redis) DEMO");
+            System.out.println("==================================================");
+            redisClient.flushAll();
+            MultiLevelCache multiLevelCache = new MultiLevelCache(redisClient, userRepository);
+
+            System.out.println("\n--- First read: L1 miss -> L2 miss -> DB fetch -> promoted to L1 and L2 ---");
+            multiLevelCache.getUser("u-101").ifPresent(System.out::println);
+
+            System.out.println("\n--- Second read: L1 HIT (no Redis round trip) ---");
+            multiLevelCache.getUser("u-101").ifPresent(System.out::println);
+
+            System.out.println("\n--- Update: evicts from both L1 and L2 ---");
+            multiLevelCache.updateUser(new User("u-101", "Alice Multi-Updated", "alice.ml@example.com"));
+
+            System.out.println("\n--- Third read after update: L1 miss -> L2 miss -> DB (fresh value) ---");
+            multiLevelCache.getUser("u-101").ifPresent(System.out::println);
+            System.out.printf("L1 cache size after demo: %d%n", multiLevelCache.l1Size());
+
+
+            // 11. CACHE WARMER
+            System.out.println("\n==================================================");
+            System.out.println("  11. CACHE WARMER (Pre-warming) DEMO");
+            System.out.println("==================================================");
+            redisClient.flushAll();
+            CacheWarmer cacheWarmer = new CacheWarmer(redisClient, userRepository);
+            List<String> hotKeys = List.of("u-101", "u-102", "u-999"); // u-999 doesn't exist
+
+            System.out.println("\n--- Warm-up: pre-loading hot keys before traffic starts ---");
+            cacheWarmer.warmUp(hotKeys);
+
+            System.out.println("\n--- Warm ratio check (health check before routing traffic) ---");
+            cacheWarmer.warmRatio(hotKeys);
+
+            System.out.println("\n--- Second warm-up run: already-warm keys are skipped ---");
+            cacheWarmer.warmUp(hotKeys);
+
+
+            // 12. SEGMENTED CACHE
+            System.out.println("\n==================================================");
+            System.out.println("  12. SEGMENTED CACHE (Namespace Partitioning) DEMO");
+            System.out.println("==================================================");
+            redisClient.flushAll();
+            SegmentedCache segmentedCache = new SegmentedCache(jedisPool);
+
+            System.out.println("\n--- Writing to different namespace segments ---");
+            segmentedCache.putUser(new User("u-101", "Alice", "alice@example.com"));
+            segmentedCache.putProduct("p-501", "{\"name\":\"Laptop\",\"price\":999}");
+            segmentedCache.putSession("sess-abc123", "u-101");
+
+            System.out.println("\n--- Reading from each segment independently ---");
+            segmentedCache.getUser("u-101").ifPresent(System.out::println);
+            segmentedCache.getProduct("p-501").ifPresent(System.out::println);
+            segmentedCache.getSession("sess-abc123").ifPresent(s -> System.out.println("Session -> userId: " + s));
+
+            System.out.println("\n--- Flush only the product segment (user and session unaffected) ---");
+            segmentedCache.flushSegment(SegmentedCache.NS_PRODUCT);
+            System.out.println("After product flush:");
+            segmentedCache.getUser("u-101").ifPresent(u -> System.out.println("User still cached: " + u));
+            segmentedCache.getProduct("p-501").ifPresent(System.out::println); // should miss
+            segmentedCache.getSession("sess-abc123").ifPresent(s -> System.out.println("Session still cached: " + s));
+
+
+            // ================================================================
+            // SECTION 4: REDIS UTILITY CLIENTS
+            // ================================================================
+
+            // 13. DISTRIBUTED LOCK
+            System.out.println("\n==================================================");
+            System.out.println("  13. DISTRIBUTED LOCK (SET NX PX) DEMO");
+            System.out.println("==================================================");
+            redisClient.flushAll();
+            DistributedLockClient lockClient = new DistributedLockClient(jedisPool);
+
+            System.out.println("\n--- Acquire lock, second acquire on same resource fails ---");
+            String token1 = lockClient.tryAcquire("resource:report-gen", 5000);
+            String token2 = lockClient.tryAcquire("resource:report-gen", 5000); // should fail
+            System.out.println("Token2 (should be null): " + token2);
+            lockClient.release("resource:report-gen", token1);
+
+            System.out.println("\n--- withLock convenience: runs task exclusively, skips if lock held ---");
+            lockClient.withLock("resource:email-send", 3000, () ->
+                    System.out.println("[TASK] Sending email exclusively from this instance."));
+
+
+            // 14. RATE LIMITER
+            System.out.println("\n==================================================");
+            System.out.println("  14. RATE LIMITER (Fixed + Sliding Window) DEMO");
+            System.out.println("==================================================");
+            redisClient.flushAll();
+            // Allow 3 requests per 10-second window for demo visibility
+            RateLimiterClient rateLimiter = new RateLimiterClient(jedisPool, 3, 10);
+
+            System.out.println("\n--- Fixed Window: 5 requests, limit=3 ---");
+            for (int i = 1; i <= 5; i++) {
+                boolean allowed = rateLimiter.allowFixedWindow("client-A");
+                System.out.printf("  Request #%d: %s%n", i, allowed ? "ALLOWED" : "DENIED");
+            }
+            System.out.printf("  Remaining quota: %d%n", rateLimiter.remainingFixedWindow("client-A"));
+
+            System.out.println("\n--- Sliding Window: 5 requests, limit=3 ---");
+            redisClient.flushAll();
+            for (int i = 1; i <= 5; i++) {
+                boolean allowed = rateLimiter.allowSlidingWindow("client-B");
+                System.out.printf("  Request #%d: %s%n", i, allowed ? "ALLOWED" : "DENIED");
+            }
+
+            System.out.println("\nAll demos completed successfully.");
         } catch (Exception e) {
             System.err.println("Redis connection error (Ensure Redis is running on localhost:6379): " + e.getMessage());
         }

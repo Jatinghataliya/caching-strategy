@@ -16,7 +16,14 @@ A comprehensive reference guide and practical Core Java implementation covering 
 4. [Cache Eviction Policies](#4-cache-eviction-policies)
 5. [Distributed Failure Modes & Mitigation](#5-distributed-failure-modes--mitigation)
 6. [Strategy Selection Matrix](#6-strategy-selection-matrix)
-7. [Java + Redis Project Setup & Running](#7-java--redis-project-setup--running)
+7. [Advanced Caching Patterns](#7-advanced-caching-patterns)
+   - [Multi-Level Cache (L1 + L2)](#multi-level-cache-l1--l2)
+   - [Cache Warmer](#cache-warmer)
+   - [Segmented Cache](#segmented-cache)
+8. [Redis Utility Clients](#8-redis-utility-clients)
+   - [Distributed Lock](#distributed-lock)
+   - [Rate Limiter](#rate-limiter)
+9. [Java + Redis Project Setup & Running](#9-java--redis-project-setup--running)
 
 ---
 
@@ -296,7 +303,147 @@ sequenceDiagram
 
 ---
 
-## 7. Java + Redis Project Setup & Running
+## 7. Advanced Caching Patterns
+
+### Multi-Level Cache (L1 + L2)
+Combines a fast local in-process cache (L1) with Redis (L2). Hot keys are served from heap memory with zero network overhead; only L1 misses reach Redis.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor App as Application
+    participant L1 as L1 Cache (local HashMap)
+    participant L2 as L2 Cache (Redis)
+    participant DB as Database
+
+    App->>L1: Get(key)
+    alt L1 Hit
+        L1-->>App: Return value (zero network cost)
+    else L1 Miss
+        App->>L2: Get(key)
+        alt L2 Hit
+            L2-->>App: Return value
+            App->>L1: Promote to L1
+        else L2 Miss
+            App->>DB: Fetch record
+            DB-->>App: Return record
+            App->>L2: Populate L2
+            App->>L1: Promote to L1
+        end
+    end
+```
+
+- **Java Source:** [`MultiLevelCache.java`](src/main/java/com/example/caching/patterns/MultiLevelCache.java)
+- **Pros:** Near-zero latency for ultra-hot keys; Redis is bypassed entirely for L1 hits.
+- **Cons:** L1 is per-instance, so multiple pods can serve slightly different values briefly after a write.
+
+---
+
+### Cache Warmer
+Proactively loads known hot keys into Redis before live traffic is routed. Prevents the cold-start penalty after deploys or cache restarts.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Warmer as Cache Warmer (startup)
+    participant DB as Database
+    participant Cache as Cache (Redis)
+    participant LB as Load Balancer
+
+    Note over Warmer,LB: Application starts - traffic not yet routed
+    Warmer->>DB: Fetch hot key list from DB
+    DB-->>Warmer: Return records
+    Warmer->>Cache: Pre-populate all hot keys
+    Warmer->>LB: Signal ready (warm ratio = 100%)
+    Note over LB: Route live traffic - cache is already warm
+```
+
+- **Java Source:** [`CacheWarmer.java`](src/main/java/com/example/caching/patterns/CacheWarmer.java)
+- **Pros:** First real request always hits cache; eliminates cold-start DB spikes.
+- **Cons:** Adds startup time; hot-key list must be maintained or derived from analytics.
+
+---
+
+### Segmented Cache
+Prefixes every key with a namespace (`user:`, `product:`, `session:`) so different entity types share one Redis instance without collisions and can be flushed independently.
+
+```mermaid
+flowchart LR
+    App[Application] --> U[user:101]
+    App --> P[product:501]
+    App --> S[session:abc]
+    U --> Redis[(Redis)]
+    P --> Redis
+    S --> Redis
+    subgraph Redis
+        U
+        P
+        S
+    end
+```
+
+- **Java Source:** [`SegmentedCache.java`](src/main/java/com/example/caching/patterns/SegmentedCache.java)
+- **Pros:** Zero key collision risk; per-segment TTL policies; selective flush without affecting other namespaces.
+- **Cons:** Slightly longer key strings; namespace discipline must be enforced across the codebase.
+
+---
+
+## 8. Redis Utility Clients
+
+### Distributed Lock
+Implements mutual exclusion across multiple JVM instances using Redis `SET NX PX`. A unique token prevents accidental release by the wrong holder, and the TTL guarantees automatic expiry if the holder crashes.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor I1 as Instance-1
+    actor I2 as Instance-2
+    participant Redis as Redis
+
+    I1->>Redis: SET lock:resource token1 NX PX 5000
+    Redis-->>I1: OK - lock acquired
+    I2->>Redis: SET lock:resource token2 NX PX 5000
+    Redis-->>I2: nil - lock already held
+    Note over I2: Instance-2 skips or retries
+    I1->>Redis: Lua: if GET==token1 then DEL
+    Redis-->>I1: Lock released
+    I2->>Redis: SET lock:resource token2 NX PX 5000
+    Redis-->>I2: OK - now acquired
+```
+
+- **Java Source:** [`DistributedLockClient.java`](src/main/java/com/example/caching/cache/DistributedLockClient.java)
+- **Pros:** Cross-JVM mutual exclusion; deadlock-safe via TTL; atomic Lua release prevents false unlocks.
+- **Cons:** Single Redis node is a SPOF; use Redlock or Redisson for multi-node quorum in critical paths.
+
+---
+
+### Rate Limiter
+Enforces per-client request quotas using Redis `INCR` + `EXPIRE`. Two strategies are implemented: Fixed Window (simple, minimal memory) and Sliding Window (weighted blend eliminates boundary bursts).
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client
+    participant RL as Rate Limiter (Redis)
+
+    Client->>RL: Request (clientId=user-42)
+    RL->>RL: INCR ratelimit:user-42:windowKey
+    alt count <= maxRequests
+        RL-->>Client: 200 OK (ALLOWED)
+    else count > maxRequests
+        RL-->>Client: 429 Too Many Requests (DENIED)
+    end
+```
+
+- **Java Source:** [`RateLimiterClient.java`](src/main/java/com/example/caching/cache/RateLimiterClient.java)
+- **Fixed Window** — [`allowFixedWindow()`](src/main/java/com/example/caching/cache/RateLimiterClient.java): simple counter per time bucket.
+- **Sliding Window** — [`allowSlidingWindow()`](src/main/java/com/example/caching/cache/RateLimiterClient.java): weighted blend of current + previous window to smooth boundary bursts.
+- **Pros:** Distributed; works across all pods; atomic via Redis single-thread model.
+- **Cons:** Fixed window allows 2x burst at boundaries (mitigated by sliding window variant).
+
+---
+
+## 9. Java + Redis Project Setup & Running
 
 ### Requirements
 - Java 17+
