@@ -197,12 +197,90 @@ sequenceDiagram
 
 ## 5. Distributed Failure Modes & Mitigation
 
-| Failure Mode | Cause | Mitigation Strategy |
-| :--- | :--- | :--- |
-| **Cache Stampede (Thundering Herd)** | Hot key expires under heavy concurrent load, causing massive DB spikes. | Mutex locking / Singleflight pattern; `Refresh-Ahead`; Probabilistic early expiration (XFetch). |
-| **Cache Avalanche** | Large volume of keys expire simultaneously or entire cache cluster restarts. | Add random TTL jitter (e.g. TTL ± 10%); Use clustered cache with replication. |
-| **Cache Penetration** | Repeated requests for non-existent keys bypass cache and hit DB directly. | Cache null/empty values with low TTL; Use Bloom Filters before cache lookups. |
-| **Data Inconsistency (Stale Cache)** | DB updated but cache invalidation fails or out-of-order writes occur. | Change Data Capture (CDC via Debezium); Transactional Outbox pattern. |
+| Failure Mode | Cause | Mitigation Strategy | Java Source |
+| :--- | :--- | :--- | :--- |
+| **Cache Stampede (Thundering Herd)** | Hot key expires under heavy concurrent load, causing massive DB spikes. | Mutex locking / Singleflight pattern; `Refresh-Ahead`; Probabilistic early expiration (XFetch). | [`CacheStampedeMitigation.java`](src/main/java/com/example/caching/failures/CacheStampedeMitigation.java) |
+| **Cache Avalanche** | Large volume of keys expire simultaneously or entire cache cluster restarts. | Random TTL jitter (base ± range); Staggered warm-up on cold restart. | [`CacheAvalancheMitigation.java`](src/main/java/com/example/caching/failures/CacheAvalancheMitigation.java) |
+| **Cache Penetration** | Repeated requests for non-existent keys bypass cache and hit DB directly. | Cache null/empty sentinel values with low TTL; Bloom Filter guard before lookups. | [`CachePenetrationMitigation.java`](src/main/java/com/example/caching/failures/CachePenetrationMitigation.java) |
+| **Data Inconsistency (Stale Cache)** | DB updated but cache invalidation fails or out-of-order writes occur. | Change Data Capture (CDC via Debezium); Transactional Outbox pattern. | [`StaleDataMitigation.java`](src/main/java/com/example/caching/failures/StaleDataMitigation.java) |
+
+### Failure Mode Details
+
+#### Cache Stampede (Thundering Herd)
+```mermaid
+sequenceDiagram
+    autonumber
+    actor T1 as Thread-1
+    actor T2 as Thread-2 … N
+    participant Cache as Cache (Redis)
+    participant DB as Database
+
+    T1->>Cache: Get(key) — MISS
+    T2->>Cache: Get(key) — MISS (simultaneous)
+    Note over T1,T2: Without mitigation: ALL threads hit DB
+    T1->>DB: [Mutex] Acquires lock — fetches record
+    T2-->>T2: [Mutex] Waits for lock
+    DB-->>T1: Return record
+    T1->>Cache: Re-populate key with TTL
+    T2->>Cache: Double-check hit — reuses result
+```
+- **Mutex / Singleflight** — [`CacheStampedeMitigation.getUserWithMutex()`](src/main/java/com/example/caching/failures/CacheStampedeMitigation.java)
+- **XFetch Probabilistic Early Expiration** — [`CacheStampedeMitigation.getUserWithXFetch()`](src/main/java/com/example/caching/failures/CacheStampedeMitigation.java)
+
+#### Cache Avalanche
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Keys as Many Cache Keys
+    participant Cache as Cache (Redis)
+    participant DB as Database
+
+    Note over Keys,Cache: Without mitigation: all keys share same TTL → all expire at once
+    Keys->>Cache: [Jitter] Set key-A TTL = 300 + random(-30..+30)
+    Keys->>Cache: [Jitter] Set key-B TTL = 300 + random(-30..+30)
+    Keys->>Cache: [Jitter] Set key-C TTL = 300 + random(-30..+30)
+    Note over Keys,Cache: Expiries spread over 60s window — DB load stays flat
+```
+- **TTL Jitter** — [`CacheAvalancheMitigation.getUser()`](src/main/java/com/example/caching/failures/CacheAvalancheMitigation.java)
+- **Staggered Warm-Up** — [`CacheAvalancheMitigation.staggeredWarmUp()`](src/main/java/com/example/caching/failures/CacheAvalancheMitigation.java)
+
+#### Cache Penetration
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Attacker
+    participant Filter as Bloom Filter
+    participant Cache as Cache (Redis)
+    participant DB as Database
+
+    Attacker->>Filter: Get(ghost-key-999)
+    Filter-->>Attacker: DEFINITELY NOT EXISTS — request blocked
+    Note over Filter,DB: DB never touched
+
+    Attacker->>Cache: Get(ghost-key-999) [without Bloom Filter]
+    Cache-->>Attacker: MISS — null sentinel found (2nd+ requests)
+    Note over Cache,DB: DB only hit once; all subsequent hits serve sentinel from cache
+```
+- **Null Sentinel Caching** — [`CachePenetrationMitigation.getUserWithNullCache()`](src/main/java/com/example/caching/failures/CachePenetrationMitigation.java)
+- **Bloom Filter Guard** — [`CachePenetrationMitigation.getUserWithBloomFilter()`](src/main/java/com/example/caching/failures/CachePenetrationMitigation.java)
+
+#### Data Inconsistency (Stale Cache)
+```mermaid
+sequenceDiagram
+    autonumber
+    actor App as Application
+    participant DB as Database
+    participant CDC as CDC Worker / Outbox Relay
+    participant Cache as Cache (Redis)
+
+    App->>DB: 1. Write updated record
+    DB-->>App: 2. Acknowledge
+    DB-)CDC: 3. Emit change event (WAL / Outbox)
+    CDC->>Cache: 4. Evict stale key
+    Note over Cache: Next read fetches fresh record from DB
+```
+- **CDC Invalidation** — [`StaleDataMitigation.updateUserWithCdc()`](src/main/java/com/example/caching/failures/StaleDataMitigation.java)
+- **Transactional Outbox** — [`StaleDataMitigation.updateUserWithOutbox()`](src/main/java/com/example/caching/failures/StaleDataMitigation.java)
 
 ---
 
